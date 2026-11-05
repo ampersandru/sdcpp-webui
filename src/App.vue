@@ -407,7 +407,7 @@ async function refreshCapabilities(): Promise<void> {
             if (selectedRecipe.value && applyRecipeDefaultsOnSelect.value) applyRecipeDefaults(form, selectedRecipe.value.defaults);
             videoLength.resetDuration();
         }
-        if (response.runtime?.runtime_recipe && (enteringCommandLine || !selectedRecipe.value)) {
+        if (!submitting.value && response.runtime?.runtime_recipe && (enteringCommandLine || !selectedRecipe.value)) {
             selectRecipe(response.runtime.runtime_recipe);
         }
         ensureOutputFormatForMode();
