@@ -11,7 +11,8 @@ import ModelSelector from "./components/ModelSelector.vue";
 import SearchableSelect from "./components/SearchableSelect.vue";
 import MediaDropzone from "./components/MediaDropzone.vue";
 import StatusChip from "./components/StatusChip.vue";
-import { cancelJob, getCapabilities, getJob, submitImageJob, submitVideoJob } from "./lib/api";
+import { cancelJob, getCapabilities, getJob, loadModel, setModelTTL, submitImageJob, submitVideoJob } from "./lib/api";
+import { canLoadAndGenerate, selectedModelIsReady } from "./lib/model-readiness";
 import { applyRecipeDefaults, buildRequestBodyForMode, createBlankForm, formFromCapabilities } from "./lib/form";
 import { availableCacheModes, featuresForMode, supportsEta, supportsFlowShift, usesSCM } from "./lib/generation-features";
 import { assignImageEntries, clearImageEntries, filesToImageEntries, removeImageEntry } from "./lib/images";
@@ -68,6 +69,16 @@ const selectedRecipe = ref<Recipe | null>(null);
 const dimensionMultiple = computed(() => sizeMultiple(selectedRecipe.value?.size_multiple));
 const applyRecipeDefaultsOnSelect = createStoredRef<boolean>("sdcpp-webui-apply-recipe-defaults", true, (value: unknown) => typeof value === "boolean" ? value : true);
 const modelSelection = ref<Record<string, string>>({});
+const modelLoadable = ref(false);
+const loadingModel = ref(false);
+const ttlDraft = ref<number | string>(0);
+const savingTTL = ref(false);
+const ttlError = ref("");
+const ttlSaved = ref(false);
+const currentTTL = computed(() => modelStatus.value?.sleep_idle_seconds);
+watch(currentTTL, (value) => {
+    if (value !== undefined) ttlDraft.value = value;
+}, { immediate: true });
 const modelReady = computed(() => modelStatus.value ? modelStatus.value.state === "ready" : Boolean(capabilities.value?.model?.name));
 const currentJob = ref<Job | null>(null);
 const selectedOutputIndex = ref(0);
@@ -106,8 +117,10 @@ const recipeMode = computed<GenerationMode>(() => {
 const previewingRecipe = computed(() => Boolean(selectedRecipe.value) &&
     (!modelReady.value || loadedRecipeId.value !== selectedRecipe.value?.id));
 const selectedModeKey = computed<"img_gen" | "vid_gen">(() => generationMode.value === "video" ? "vid_gen" : "img_gen");
-const canGenerate = computed(() => modelReady.value && !previewingRecipe.value &&
-    (!supportedModes.value.length || supportedModes.value.includes(selectedModeKey.value)));
+const selectionReady = computed(() => selectedModelIsReady(modelStatus.value, selectedRecipe.value, modelSelection.value));
+const needsModelLoad = computed(() => !selectionReady.value);
+const canGenerate = computed(() => canLoadAndGenerate(modelStatus.value, selectedRecipe.value, modelLoadable.value) &&
+    (!selectionReady.value || !supportedModes.value.length || supportedModes.value.includes(selectedModeKey.value)));
 const currentJobModeKey = computed<"img_gen" | "vid_gen">(() => currentJob.value?.kind || selectedModeKey.value);
 const selectedModeFeatures = computed(() => {
     return capabilities.value?.features_by_mode?.[selectedModeKey.value] || {};
@@ -398,7 +411,7 @@ async function refreshCapabilities(): Promise<void> {
             selectRecipe(response.runtime.runtime_recipe);
         }
         ensureOutputFormatForMode();
-        clearMessage();
+        if (response.runtime?.state !== "error") clearMessage();
     } catch (error) {
         capabilitiesError.value = error instanceof Error ? error.message : String(error);
         serviceOnline.value = false;
@@ -498,7 +511,22 @@ async function generate(): Promise<void> {
     if (invalidSize) { setMessage(invalidSize, "error"); return; }
     if (generationMode.value === "video" && videoLength.error) { setMessage(videoLength.error, "error"); return; }
     submitting.value = true;
+    const requestBase = baseUrl.value;
     try {
+        if (needsModelLoad.value && selectedRecipe.value) {
+            loadingModel.value = true;
+            setMessage("Loading model…", "");
+            const loaded = await loadModel(requestBase, selectedRecipe.value.id, { ...modelSelection.value });
+            if (requestBase !== baseUrl.value) throw new Error("Server address changed; generation was not submitted.");
+            modelStatus.value = loaded;
+            const loadedCapabilities = await getCapabilities(requestBase);
+            if (requestBase !== baseUrl.value) throw new Error("Server address changed; generation was not submitted.");
+            capabilities.value = loadedCapabilities;
+            if (loaded.state !== "ready") throw new Error(loaded.error || "Model did not finish loading.");
+            if (!capabilities.value.supported_modes?.includes(selectedModeKey.value))
+                throw new Error("The selected model does not support this generation mode.");
+            loadingModel.value = false;
+        }
         const request = buildRequestBodyForMode(generationMode.value, {
             ...form,
             ...(generationMode.value === "video" ? { video_frames: videoLength.frames, fps: videoLength.fps } : {}),
@@ -510,14 +538,37 @@ async function generate(): Promise<void> {
         selectedOutputIndex.value = 0;
         startElapsedTimer();
         currentJob.value = generationMode.value === "video"
-            ? await submitVideoJob(baseUrl.value, request)
-            : await submitImageJob(baseUrl.value, request);
+            ? await submitVideoJob(requestBase, request)
+            : await submitImageJob(requestBase, request);
         await pollJob(currentJob.value.id);
     } catch (error) {
         stopElapsedTimer();
         setMessage(error instanceof Error ? error.message : String(error), "error");
     } finally {
+        loadingModel.value = false;
         submitting.value = false;
+    }
+}
+
+async function saveTTL(): Promise<void> {
+    const seconds = Number(ttlDraft.value);
+    ttlSaved.value = false;
+    if (ttlDraft.value === "" || !Number.isInteger(seconds) || seconds < 0 || seconds > 2147483647) {
+        ttlError.value = "Enter a whole number of seconds from 0 to 2147483647.";
+        return;
+    }
+    savingTTL.value = true;
+    ttlError.value = "";
+    const base = baseUrl.value;
+    try {
+        const status = await setModelTTL(base, seconds);
+        if (base !== baseUrl.value) return;
+        modelStatus.value = status;
+        ttlSaved.value = true;
+    } catch (error) {
+        if (base === baseUrl.value) ttlError.value = error instanceof Error ? error.message : String(error);
+    } finally {
+        savingTTL.value = false;
     }
 }
 
@@ -673,7 +724,13 @@ async function acceptReferenceFiles(files: FileList): Promise<void> {
     }
 }
 
-watch(baseUrl, () => { selectedRecipe.value = null; });
+watch(baseUrl, () => {
+    selectedRecipe.value = null;
+    modelStatus.value = null;
+    modelLoadable.value = false;
+    ttlSaved.value = false;
+    ttlError.value = "";
+});
 
 watch(cacheModes, (modes) => { if (!modes.includes(form.cache.mode)) form.cache.mode = "disabled"; });
 watch(generationFeatures, (features) => {
@@ -761,6 +818,23 @@ onBeforeUnmount(() => {
                         <input v-model.number="pollIntervalMs" type="number" min="1" step="1" />
                     </div>
                 </div>
+                <fieldset class="settings__group">
+                    <legend>Model idle timeout (TTL)</legend>
+                    <div class="settings__grid">
+                        <div class="field">
+                            <label for="model-ttl">Idle timeout (seconds)</label>
+                            <input id="model-ttl" v-model="ttlDraft" type="number" min="0" max="2147483647" step="1" :disabled="savingTTL || currentTTL === undefined" />
+                        </div>
+                        <div class="field">
+                            <label>Current server timeout</label>
+                            <input :value="currentTTL === undefined ? 'Unavailable' : currentTTL === 0 ? 'Disabled' : `${currentTTL} seconds`" readonly />
+                        </div>
+                    </div>
+                    <p class="hint">Unload idle models after this interval. 0 keeps them loaded. Changes apply to this running server; a restart restores the startup setting.</p>
+                    <button class="btn-secondary" type="button" :disabled="savingTTL || currentTTL === undefined" @click="saveTTL">{{ savingTTL ? 'Applying…' : 'Apply timeout' }}</button>
+                    <p v-if="ttlError" class="hint" role="alert">{{ ttlError }}</p>
+                    <p v-else-if="ttlSaved" class="hint" role="status">Timeout updated.</p>
+                </fieldset>
                 <fieldset class="settings__group">
                     <legend>Live Preview</legend>
                     <div class="settings__grid">
@@ -867,7 +941,7 @@ onBeforeUnmount(() => {
                 </div>
             </section>
             <PromptComposer ref="composer" :form="form" :mode="generationMode" :model-label="selectedRecipe?.name || (modelReady ? modelName : 'Choose model')"
-                :model-ready="canGenerate" :disabled="!canGenerate || mediaProcessing || submitting || (generationMode === 'video' && Boolean(videoLength.error))" :busy="isJobRunning"
+                :model-ready="selectionReady" :load-required="needsModelLoad" :submitting="submitting" :loading-model="loadingModel" :disabled="!canGenerate || mediaProcessing || submitting || (generationMode === 'video' && Boolean(videoLength.error))" :busy="isJobRunning"
                 :video-summary="videoLength.summary" :video-details="videoLength.details"
                 :can-cancel="canCancelCurrentJob" :cancelling="cancelling || Boolean(currentJob?.cancel_requested)"
                 :has-loras="showLoras" :lora-count="loras.filter(item => item.path).length"
@@ -880,7 +954,7 @@ onBeforeUnmount(() => {
                         @clear-media="kind => kind === 'video' ? videoInput.clear() : audioInput.clear()" @preview-media="sectionState.referenceMedia = true; composer?.openMore($event)" />
                 </template>
                 <template #models>
-        <ModelSelector embedded v-model:apply-defaults="applyRecipeDefaultsOnSelect" :base-url="baseUrl" :busy="isJobRunning" :lora-summary="loraSummary" @status="modelStatus = $event" @changed="refreshCapabilities" @recipe="selectRecipe" @selection="modelSelection = $event" @catalog-recipe="updateCatalogRecipe">
+        <ModelSelector embedded v-model:apply-defaults="applyRecipeDefaultsOnSelect" :base-url="baseUrl" :busy="isJobRunning || submitting" :lora-summary="loraSummary" @status="modelStatus = $event" @changed="refreshCapabilities" @recipe="selectRecipe" @selection="modelSelection = $event" @loadable="modelLoadable = $event" @catalog-recipe="updateCatalogRecipe">
         </ModelSelector>
                 </template>
                 <template #lora>
